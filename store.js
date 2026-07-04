@@ -1,0 +1,122 @@
+// store.js — 저장소 추상화. DATABASE_URL 있으면 PostgreSQL+pgvector, 없으면 in-memory 폴백.
+// 인터페이스: getSeller(id) / searchPast(id,cat,inquiry,emb,k) / addPast(id,{inquiry,category,text,emb})
+
+const hasDB = () => !!process.env.DATABASE_URL;
+
+function cos(a, b) {
+  let d = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) { d += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  return d / (Math.sqrt(na) * Math.sqrt(nb) || 1);
+}
+function overlap(a, b) {
+  const set = new Set(String(b).replace(/[.,!?]/g, "").split(/\s+/));
+  return String(a).split(/\s+/).filter((w) => w.length > 1 && set.has(w)).length;
+}
+const SIM_THRESHOLD = 0.78;
+
+// ---------- in-memory ----------
+const KB = {
+  "demo-seller-1": {
+    shop: "데모상점", tone: "friendly", apiKey: "demo-key-123",
+    policy: {
+      배송: "오후 3시 이전 결제 시 당일 출고, 보통 1~2일 내 도착(주말·공휴일 제외).",
+      "교환/환불": "미착용·택 부착 시 수령 후 7일 이내 교환. 단순변심 왕복 배송비 6,000원.",
+    },
+  },
+};
+const PAST = {};
+const memStore = {
+  async getSeller(id) { return KB[id] || { shop: "상점", tone: "friendly", policy: {} }; },
+  async searchPast(id, cat, inquiry, emb, k = 3) {
+    const arr = (PAST[id] || []).filter((p) => p.category === cat);
+    if (emb) {
+      return arr.map((p) => ({ p, s: p.emb ? cos(emb, p.emb) : 0 }))
+        .filter((x) => x.s > SIM_THRESHOLD).sort((a, b) => b.s - a.s).slice(0, k).map((x) => x.p);
+    }
+    return arr.map((p) => ({ p, s: overlap(inquiry, p.inquiry) }))
+      .filter((x) => x.s > 0).sort((a, b) => b.s - a.s || b.p.ts - a.p.ts).slice(0, k).map((x) => x.p);
+  },
+  async addPast(id, r) { (PAST[id] || (PAST[id] = [])).push({ ...r, ts: Date.now() }); return { ok: true, count: PAST[id].length }; },
+};
+
+// ---------- PostgreSQL + pgvector ----------
+let pool = null;
+function pg() {
+  if (!pool) { const { Pool } = require("pg"); pool = new Pool({ connectionString: process.env.DATABASE_URL }); }
+  return pool;
+}
+const toVec = (emb) => (emb ? "[" + emb.join(",") + "]" : null);
+const dbStore = {
+  async getSeller(id) {
+    const s = await pg().query("SELECT shop_name, tone FROM sellers WHERE id=$1", [id]);
+    const pol = await pg().query("SELECT title, body FROM knowledge_items WHERE seller_id=$1 AND type='policy'", [id]);
+    const policy = {}; pol.rows.forEach((r) => (policy[r.title] = r.body));
+    const row = s.rows[0] || {};
+    return { shop: row.shop_name || "상점", tone: row.tone || "friendly", policy };
+  },
+  async searchPast(id, cat, inquiry, emb, k = 3) {
+    if (emb) {
+      const q = await pg().query(
+        `SELECT inquiry, text, 1-(embedding<=>$1::vector) AS sim
+           FROM past_answers
+          WHERE seller_id=$2 AND category=$3 AND embedding IS NOT NULL
+          ORDER BY embedding<=>$1::vector LIMIT $4`,
+        [toVec(emb), id, cat, k]);
+      return q.rows.filter((r) => r.sim > SIM_THRESHOLD);
+    }
+    const q = await pg().query(
+      `SELECT inquiry, text FROM past_answers WHERE seller_id=$1 AND category=$2 ORDER BY created_at DESC LIMIT $3`,
+      [id, cat, k]);
+    return q.rows;
+  },
+  async addPast(id, r) {
+    await pg().query(
+      `INSERT INTO past_answers (seller_id, inquiry, category, text, embedding) VALUES ($1,$2,$3,$4,$5::vector)`,
+      [id, r.inquiry, r.category, r.text, toVec(r.emb)]);
+    return { ok: true };
+  },
+};
+
+// ---------- 지표 이벤트 + 집계 ----------
+const EVENTS = []; // memory
+function computeStats(rows) {
+  const drafts = rows.filter((r) => r.kind === "draft");
+  const sends = rows.filter((r) => r.kind === "send");
+  const nonEsc = drafts.filter((d) => !d.escalated);
+  const learned = nonEsc.filter((d) => d.source === "learned").length;
+  const adopted = sends.filter((s) => !s.edited).length;
+  const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0);
+  const categories = {};
+  drafts.forEach((d) => { if (d.category) categories[d.category] = (categories[d.category] || 0) + 1; });
+  return {
+    drafts: drafts.length,
+    sends: sends.length,
+    escalate_rate: pct(drafts.filter((d) => d.escalated).length, drafts.length),
+    adopt_rate: pct(adopted, sends.length),
+    learned_rate: pct(learned, nonEsc.length),
+    categories,
+  };
+}
+memStore.addEvent = async (sellerId, e) => { EVENTS.push({ seller_id: sellerId, ...e, ts: Date.now() }); };
+memStore.getStats = async (sellerId) => computeStats(EVENTS.filter((e) => e.seller_id === sellerId));
+dbStore.addEvent = async (sellerId, e) => {
+  await pg().query(
+    `INSERT INTO events (seller_id, kind, category, escalated, edited, source) VALUES ($1,$2,$3,$4,$5,$6)`,
+    [sellerId, e.kind, e.category || null, e.escalated ?? null, e.edited ?? null, e.source || null]);
+};
+dbStore.getStats = async (sellerId) => {
+  const q = await pg().query(`SELECT kind, category, escalated, edited, source FROM events WHERE seller_id=$1`, [sellerId]);
+  return computeStats(q.rows);
+};
+
+// ---------- 인증: API 키 → sellerId (멀티테넌시) ----------
+memStore.getSellerIdByKey = async (key) => {
+  for (const [id, v] of Object.entries(KB)) if (v.apiKey === key) return id;
+  return null;
+};
+dbStore.getSellerIdByKey = async (key) => {
+  const q = await pg().query("SELECT id FROM sellers WHERE api_key=$1", [key]);
+  return q.rows[0]?.id || null;
+};
+
+module.exports = { store: hasDB() ? dbStore : memStore, hasDB };
