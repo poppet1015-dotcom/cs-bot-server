@@ -1,23 +1,21 @@
-// server.js (v5) — 인증(API 키) + 멀티테넌시. 클라이언트 sellerId를 신뢰하지 않고,
-// Authorization: Bearer <key> 로 서버가 sellerId를 판별한다. 모든 데이터는 sellerId로 격리.
+// server.js (v6) — 답변 엔진 백엔드. /draft·/feedback·/stats + /webhook/talktalk + /admin/knowledge(자율 편집).
 const express = require("express");
 const cors = require("cors");
 const { draft, recordFeedback } = require("./answerEngine");
 const { store } = require("./store");
 
 const app = express();
-// CORS: 운영에선 ALLOWED_ORIGINS(쉼표구분)로 제한. 미설정 시(개발) 전체 허용.
 const ORIGINS = (process.env.ALLOWED_ORIGINS || "").split(",").map((s) => s.trim()).filter(Boolean);
 app.use(cors(ORIGINS.length ? { origin: ORIGINS } : {}));
-app.use(express.json({ limit: "256kb" }));
+app.use(express.json({ limit: "512kb" }));
 
-// --- 인증 미들웨어 ---
+// --- 인증: Authorization: Bearer <API키> → req.sellerId ---
 async function auth(req, res, next) {
   const h = req.get("Authorization") || "";
   const key = h.startsWith("Bearer ") ? h.slice(7).trim() : (req.query.key || "");
   const sellerId = key ? await store.getSellerIdByKey(key) : null;
   if (!sellerId) return res.status(401).json({ error: "유효한 API 키가 필요합니다" });
-  req.sellerId = sellerId; // ← 이후 모든 로직은 이 값만 사용
+  req.sellerId = sellerId;
   next();
 }
 
@@ -45,11 +43,27 @@ app.get("/stats", auth, async (req, res) => {
   catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
-// 네이버 톡톡 챗봇 웹훅(공식 마켓 경로). Bearer 인증 대신 경로 토큰으로 테넌트 식별.
-// 주의: 운영에선 톡톡 서명 헤더 검증을 추가할 것.
+// --- 관리 페이지: 정책·질문 자율 편집 (즉시 반영) ---
+app.get("/admin/knowledge", auth, async (req, res) => {
+  try {
+    const kb = await store.getSeller(req.sellerId);
+    const items = await store.getKnowledge(req.sellerId);
+    res.json({ shop: kb.shop, tone: kb.tone, items });
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
+app.post("/admin/knowledge", auth, async (req, res) => {
+  try {
+    const items = Array.isArray(req.body.items) ? req.body.items : [];
+    const r = await store.setKnowledge(req.sellerId, items);
+    res.json(r); // 저장 즉시 봇이 새 내용으로 답함
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
+// --- 네이버 톡톡 챗봇 웹훅 ---
 app.use("/webhook/talktalk", require("./talktalkWebhook"));
 
 app.get("/health", (_req, res) => res.json({ ok: true, llm: !!process.env.LLM_API_KEY, db: !!process.env.DATABASE_URL }));
 
 const PORT = process.env.PORT || 8787;
-app.listen(PORT, () => console.log(`answer engine (v5) on :${PORT} · LLM ${process.env.LLM_API_KEY ? "on" : "off"} · DB ${process.env.DATABASE_URL ? "on" : "off"}`));
+app.listen(PORT, () => console.log(`answer engine (v6) on :${PORT} · LLM ${process.env.LLM_API_KEY ? "on" : "off"} · DB ${process.env.DATABASE_URL ? "on" : "off"}`));

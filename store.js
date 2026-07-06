@@ -1,5 +1,5 @@
 // store.js — 저장소 추상화. DATABASE_URL 있으면 PostgreSQL+pgvector, 없으면 in-memory 폴백.
-// getSeller(id) 는 셀러의 '모든' 등록 지식(knowledge)을 함께 반환한다.
+// getSeller(id): 답변용(shop/tone/knowledge). getKnowledge/setKnowledge: 관리 페이지용(자율 편집).
 
 const hasDB = () => !!process.env.DATABASE_URL;
 
@@ -25,12 +25,18 @@ const memStore = {
     return s ? { shop: s.shop, tone: s.tone, knowledge: s.knowledge || [] }
              : { shop: "상점", tone: "friendly", knowledge: [] };
   },
+  async getKnowledge(id) { return (KB[id]?.knowledge || []).map((k) => ({ title: k.title, body: k.body, type: "faq" })); },
+  async setKnowledge(id, items) {
+    if (!KB[id]) KB[id] = { shop: "상점", tone: "friendly", knowledge: [] };
+    KB[id].knowledge = items.filter((it) => it.title && it.body).map((it) => ({ title: it.title, body: it.body }));
+    return { ok: true, count: KB[id].knowledge.length };
+  },
   async searchPast(id, cat, inquiry, emb, k = 3) {
     const arr = (PAST[id] || []).filter((p) => p.category === cat);
     return arr.map((p) => ({ p, s: overlap(inquiry, p.inquiry) }))
       .filter((x) => x.s > 0).sort((a, b) => b.s - a.s || b.p.ts - a.p.ts).slice(0, k).map((x) => x.p);
   },
-  async addPast(id, r) { (PAST[id] || (PAST[id] = [])).push({ ...r, ts: Date.now() }); return { ok: true, count: PAST[id].length }; },
+  async addPast(id, r) { (PAST[id] || (PAST[id] = [])).push({ ...r, ts: Date.now() }); return { ok: true }; },
 };
 
 // ---------- PostgreSQL + pgvector ----------
@@ -49,6 +55,22 @@ const dbStore = {
     const k = await pg().query("SELECT title, body FROM knowledge_items WHERE seller_id=$1 ORDER BY id", [id]);
     const row = s.rows[0] || {};
     return { shop: row.shop_name || "상점", tone: row.tone || "friendly", knowledge: k.rows };
+  },
+  async getKnowledge(id) {
+    const k = await pg().query("SELECT title, body, type FROM knowledge_items WHERE seller_id=$1 ORDER BY id", [id]);
+    return k.rows;
+  },
+  async setKnowledge(id, items) {
+    const client = pg();
+    await client.query("DELETE FROM knowledge_items WHERE seller_id=$1", [id]);
+    let n = 0;
+    for (const it of items) {
+      if (!it.title || !it.body) continue;
+      await client.query("INSERT INTO knowledge_items (seller_id, type, title, body) VALUES ($1,$2,$3,$4)",
+        [id, it.type || "faq", it.title, it.body]);
+      n++;
+    }
+    return { ok: true, count: n };
   },
   async searchPast(id, cat, inquiry, emb, k = 3) {
     const q = await pg().query(
@@ -74,8 +96,7 @@ function computeStats(rows) {
   const categories = {};
   drafts.forEach((d) => { if (d.category) categories[d.category] = (categories[d.category] || 0) + 1; });
   return {
-    drafts: drafts.length,
-    sends: sends.length,
+    drafts: drafts.length, sends: sends.length,
     escalate_rate: pct(drafts.filter((d) => d.escalated).length, drafts.length),
     adopt_rate: pct(sends.filter((s) => !s.edited).length, sends.length),
     learned_rate: pct(nonEsc.filter((d) => d.source === "learned").length, nonEsc.length),
